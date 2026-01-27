@@ -19,3 +19,5 @@ SHA256: dad30b......509db2
 
 **License:** Original code © 2026 c.o.r.a. (GPLv3)</br>
 **Note:** Users responsible for key security and backups.
+
+<img width="350" height="175" alt="v3" src="https://github.com/user-attachments/assets/3d8c1900-7fb6-4de4-8dcf-2083111886ea" />
