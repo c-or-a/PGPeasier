@@ -1,4 +1,5 @@
 # PGPeasier by c.o.r.a.
+A Python based PGP tool with keyring encryption.
 
 SHA256: dad30b......509db2
 
