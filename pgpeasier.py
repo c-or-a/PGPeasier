@@ -596,38 +596,42 @@ def select_file(sender, appdata):
     root.destroy()
 
 def encrypt_file(sender, app_data):
-    global dF
-    _, pub_blob = get_keypair(dpg.get_value("pub"))
-    if pub_blob and dF and os.path.exists(dF):
+    global dF, encryption_key
+    priv_blob, _ = get_keypair(dpg.get_value("pub"))
+    if priv_blob and encryption_key and dF and os.path.exists(dF):
         try:
-            pub_key, _ = pgpy.PGPKey.from_blob(str(pub_blob))
+            combined_material = str(priv_blob).encode() + bytes(encryption_key)
+            derived_password = hashlib.sha512(combined_material).hexdigest()
             with open(dF, 'rb') as f:
                 file_data = f.read()
             msg = pgpy.PGPMessage.new(file_data)
-            encrypted_msg = pub_key.encrypt(msg)
+            encrypted_msg = msg.encrypt(derived_password)
             out = bytes(encrypted_msg)
             with open(dF, 'wb') as f:
                 f.write(out)
-        except Exception as e: 
+            derived_password = None
+            file_data = None
+        except Exception as e:
             if DEBUG:
                 print(f"Encryption failed: {e}")
 
 def decrypt_file(sender, app_data):
-    global dF
+    global dF, encryption_key
     priv_blob, _ = get_keypair(dpg.get_value("pub"))
-    if priv_blob and dF and os.path.exists(dF):
-        priv_key, _ = pgpy.PGPKey.from_blob(str(priv_blob))
+    if priv_blob and encryption_key and dF and os.path.exists(dF):
         try:
+            combined_material = str(priv_blob).encode() + bytes(encryption_key)
+            derived_password = hashlib.sha512(combined_material).hexdigest()
             msg = pgpy.PGPMessage.from_file(dF)
-            decrypted_msg = priv_key.decrypt(msg)
+            decrypted_msg = msg.decrypt(derived_password)
             dec_data = decrypted_msg.message
             if isinstance(dec_data, str):
                 dec_data = dec_data.encode('utf-8')
             with open(dF, 'wb') as f:
                 f.write(dec_data)
-            priv_key = None
-            decrypted_msg = None
-        except Exception as e: 
+            derived_password = None
+            priv_blob = None
+        except Exception as e:
             if DEBUG:
                 print(f"Decryption failed: {e}")
 
