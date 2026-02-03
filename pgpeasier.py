@@ -424,7 +424,7 @@ def get_cipher(password, salt=None):
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=100000,
+        iterations=1200000,
     )
     key = kdf.derive(password.encode())
     return key, salt
@@ -443,7 +443,7 @@ def get_combined_hash(priv_blob, encryption_key):
         algorithm=hashes.SHA256(),
         length=64,
         salt=salt_part,
-        iterations=310000,
+        iterations=3100000,
     )
     derived_key = kdf.derive(password_part)
     return hashlib.sha512(derived_key).hexdigest()
@@ -905,6 +905,7 @@ while dpg.is_dearpygui_running():
     dpg.render_dearpygui_frame()
 dpg.destroy_context()
 
+# Clean up security monitor
 if 'security_monitor' in globals():
     globals()['security_monitor'].stop()
 
