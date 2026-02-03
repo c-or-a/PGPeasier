@@ -46,8 +46,19 @@ import hashlib
 import subprocess
 import json
 import re
+import time
+import hmac
+import threading
+import queue
 from ctypes import wintypes
 #---------------------------#
+
+kernel32 = ctypes.WinDLL('kernel32')
+user32 = ctypes.WinDLL('user32')
+SW_HIDE = 0
+hwnd = kernel32.GetConsoleWindow()
+if hwnd:
+    user32.ShowWindow(hwnd, SW_HIDE)
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -81,203 +92,232 @@ except ImportError:
 #-------------------------------------------------#
 
 #---------------security checks---------------#
-def check_debuggers():
-    suspicious = []
-    debugger_processes = [
-        'x64dbg.exe', 'x32dbg.exe', 'ollydbg.exe', 'ida.exe', 'ida64.exe',
-        'windbg.exe', 'dbgview.exe', 'procexp.exe', 'procmon.exe', 'tcpview.exe',
-        'processhacker.exe', 'cheatengine.exe', 'hxd.exe', '010editor.exe',
-        'dnspy.exe', 'ilspy.exe', 'reflexil.exe', 'peid.exe', 'cff.exe',
-        'lordpe.exe', 'importrec.exe', 'de4dot.exe', 'upx.exe', 'die.exe',
-        'recstudio.exe', 'ghidra.exe', 'binaryninja.exe', 'radare2.exe',
-        'r2.exe', 'immunitydebugger.exe', 'sysinternals.exe', 'vmmap.exe',
-        'regmon.exe', 'filemon.exe', 'hiew.exe', 'petools.exe'
-    ]
-    try:
-        import psutil
-        for proc in psutil.process_iter(['name', 'exe']):
-            try:
-                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-                proc_exe = proc.info['exe'].lower() if proc.info['exe'] else ''
-                for debugger in debugger_processes:
-                    debugger_lower = debugger.lower()
-                    if debugger_lower in proc_name or debugger_lower in proc_exe:
-                        suspicious.append(f"Debugger detected: {proc_name}")
-                        break
-                try:
-                    if proc.pid:
-                        def enum_windows_callback(hwnd, results):
-                            if win32gui.IsWindowVisible(hwnd):
-                                window_text = win32gui.GetWindowText(hwnd).lower()
-                                debug_keywords = ['debug', 'dbg', 'ollydbg', 'ida', 'windbg', 'x64dbg', 'x32dbg', 'disassembler', 'hex editor', 'cheat engine']
-                                for keyword in debug_keywords:
-                                    if keyword in window_text:
-                                        results.append(f"Debugger window: {window_text}")
-                            return True
-                        results = []
-                        win32gui.EnumWindows(enum_windows_callback, results)
-                        suspicious.extend(results)
-                except:
-                    pass
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-    except ImportError:
-        try:
-            output = subprocess.check_output('tasklist /fo csv', shell=True, text=True)
-            for line in output.split('\n')[1:]:
-                if line.strip():
-                    parts = line.split(',')
-                    if len(parts) > 0:
-                        proc_name = parts[0].strip('"').lower()
-                        for debugger in debugger_processes:
-                            if debugger.lower() in proc_name:
-                                suspicious.append(f"Debugger detected: {proc_name}")
-        except:
-            pass
-    try:
-        is_debugger_present = ctypes.windll.kernel32.IsDebuggerPresent()
-        if is_debugger_present:
-            suspicious.append("Debugger detected via IsDebuggerPresent API")
-        ProcessDebugPort = 7
-        h_process = ctypes.windll.kernel32.GetCurrentProcess()
-        debug_port = ctypes.c_ulong()
-        ctypes.windll.ntdll.NtQueryInformationProcess(
-            h_process, ProcessDebugPort, 
-            ctypes.byref(debug_port), ctypes.sizeof(debug_port), None
-        )
-        if debug_port.value != 0:
-            suspicious.append("Debugger detected via NtQueryInformationProcess")
-    except:
-        pass
-    return suspicious
+def constant_time_compare(a, b):
+    if isinstance(a, str):
+        a = a.encode()
+    if isinstance(b, str):
+        b = b.encode()
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= x ^ y
+    return result == 0
 
-def check_virtual_machine():
-    suspicious = []
-    try:
-        #virtual machine indicators
-        c = wmi.WMI()
-        # Check manufacturer
-        for computer in c.Win32_ComputerSystem():
-            manufacturer = computer.Manufacturer.lower()
-            model = computer.Model.lower()
-            
-            vm_indicators = ['vmware', 'virtualbox', 'qemu', 'xen', 'hyper-v', 'microsoft corporation', 'innotek gmbh']
-            for indicator in vm_indicators:
-                if indicator in manufacturer or indicator in model:
-                    suspicious.append(f"Running in VM: {manufacturer} {model}")
-        #VM processes
-        vm_processes = ['vmtoolsd.exe', 'vboxservice.exe', 'vboxtray.exe', 'qemu-ga.exe']
+class SecurityMonitor:
+    def __init__(self):
+        self.running = True
+        self.suspicious_count = 0
+        self.max_suspicious = 10
+        self.detected_threats = []
+        self.thread = None
+        self.check_queue = queue.Queue()
+        self.last_check_time = {}
+
+        self.debugger_processes = [
+            'x64dbg.exe', 'x32dbg.exe', 'ollydbg.exe', 'ida.exe', 'ida64.exe',
+            'windbg.exe', 'dbgview.exe', 'procexp.exe', 'procmon.exe',
+            'processhacker.exe', 'cheatengine.exe'
+        ]
+        
+        self.keylogger_indicators = [
+            'keylog', 'klog', 'klg', 'keylogger', 'spy', 'monitor',
+            'recorder', 'sniffer', 'hookkb', 'hookmouse'
+        ]
+    
+    def start(self):
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+    
+    def _should_check(self, check_name, interval):
+        current_time = time.time()
+        last_time = self.last_check_time.get(check_name, 0)
+        return current_time - last_time >= interval
+    
+    def _update_check_time(self, check_name):
+        self.last_check_time[check_name] = time.time()
+    
+    def _check_debuggers(self):
+        suspicious = []
+        
         try:
-            import psutil
-            for proc in psutil.process_iter(['name']):
+            is_debugger_present = ctypes.windll.kernel32.IsDebuggerPresent()
+            if is_debugger_present:
+                suspicious.append("Debugger detected via IsDebuggerPresent")
+            
+            try:
+                import psutil
+                count = 0
+                for proc in psutil.process_iter(['name']):
+                    try:
+                        proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                        for debugger in self.debugger_processes[:10]:
+                            if debugger in proc_name:
+                                suspicious.append(f"Debugger process: {proc_name}")
+                                break
+                        count += 1
+                        if count > 50:
+                            break
+                    except:
+                        continue
+            except ImportError:
+                pass
+                
+        except Exception as e:
+            if "DEBUG" in globals() and DEBUG:
+                print(f"Debugger check error: {e}")
+        
+        return suspicious
+    
+    def _check_virtualization(self):
+        suspicious = []
+        
+        try:
+            c = wmi.WMI()
+            for computer in c.Win32_ComputerSystem()[:2]:
+                manufacturer = computer.Manufacturer.lower()
+                model = computer.Model.lower()
+                vm_indicators = ['vmware', 'virtualbox', 'qemu', 'hyper-v']
+                for indicator in vm_indicators:
+                    if indicator in manufacturer or indicator in model:
+                        suspicious.append(f"VM: {manufacturer} {model}")
+                        break    
+        except Exception as e:
+            if "DEBUG" in globals() and DEBUG:
+                print(f"VM check error: {e}")
+        return suspicious
+    
+    def _check_drivers(self):
+        suspicious = []
+        
+        try:
+            c = wmi.WMI()
+            trusted_vendors = ['amd', 'nvidia', 'intel', 'microsoft', 'realtek']
+            drivers = list(c.Win32_SystemDriver(State="Running"))[:20]
+            for driver in drivers:
                 try:
-                    proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-                    for vm_proc in vm_processes:
-                        if vm_proc in proc_name:
-                            suspicious.append(f"VM tool detected: {proc_name}")
+                    driver_name = driver.Name.lower()
+                    if any(vendor in driver_name for vendor in trusted_vendors):
+                        continue
+                    if any(indicator in driver_name for indicator in self.keylogger_indicators):
+                        suspicious.append(f"Suspicious driver: {driver.Name}")
                 except:
                     continue
-        except ImportError:
-            pass
-    except:
-        pass
-    return suspicious
+        except Exception as e:
+            if "DEBUG" in globals() and DEBUG:
+                print(f"Driver check error: {e}")
+        
+        return suspicious
+    
+    def _check_keyloggers(self):
+        suspicious = []
+        try:
+            try:
+                import psutil
+                count = 0
+                for proc in psutil.process_iter(['name']):
+                    try:
+                        proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                        for indicator in self.keylogger_indicators[:10]:
+                            if indicator in proc_name:
+                                suspicious.append(f"Keylogger process: {proc_name}")
+                                break
+                        count += 1
+                        if count > 30:
+                            break
+                    except:
+                        continue
+            except ImportError:
+                pass
+                
+        except Exception as e:
+            if "DEBUG" in globals() and DEBUG:
+                print(f"Keylogger check error: {e}")
+        
+        return suspicious
+    
+    def _check_memory(self):
+        suspicious = []
+        
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            if mem_info.rss > 300 * 1024 * 1024:
+                suspicious.append(f"High memory: {mem_info.rss // (1024*1024)}MB")
+        except Exception as e:
+            if "DEBUG" in globals() and DEBUG:
+                print(f"Memory check error: {e}")
+        
+        return suspicious
+    
+    def _run_checks(self):
+        all_suspicious = []
+        if self._should_check('debuggers', 3):
+            all_suspicious.extend(self._check_debuggers())
+            self._update_check_time('debuggers')
+        if self._should_check('virtualization', 7):
+            all_suspicious.extend(self._check_virtualization())
+            self._update_check_time('virtualization')
+        if self._should_check('drivers', 10):
+            all_suspicious.extend(self._check_drivers())
+            self._update_check_time('drivers')
+        if self._should_check('keyloggers', 5):
+            all_suspicious.extend(self._check_keyloggers())
+            self._update_check_time('keyloggers')
+        if self._should_check('memory', 8):
+            all_suspicious.extend(self._check_memory())
+            self._update_check_time('memory')
+        
+        return all_suspicious
+    
+    def _monitor_loop(self):
+        while self.running:
+            try:
+                suspicious = self._run_checks()
+                if suspicious:
+                    self.detected_threats.extend(suspicious)
+                    self.suspicious_count += len(suspicious)
+                    if len(self.detected_threats) > 20:
+                        self.detected_threats = self.detected_threats[-20:]
+                    if self.suspicious_count >= self.max_suspicious:
+                        self._critical_response()
+                time.sleep(1)
+            except Exception as e:
+                if "DEBUG" in globals() and DEBUG:
+                    print(f"Monitor loop error: {e}")
+                time.sleep(2)
+    
+    def _critical_response(self):
+        if self.detected_threats:
+            recent_threats = self.detected_threats[-5:]
+            
+            message = "CRITICAL SECURITY THREAT\n\n"
+            message += "Multiple security violations detected:\n"
+            for threat in recent_threats:
+                message += f"• {threat}\n"
+            message += "\nApplication will now exit."
+            ctypes.windll.user32.MessageBoxW(0, message, "Critical Security Alert", 0x10)
+    
+            os._exit(1)
 
 def comprehensive_security_check():
     all_suspicious = []
     
-    #debuggers and binary analysis tools
-    debugger_suspicious = check_debuggers()
-    all_suspicious.extend(debugger_suspicious)
-    
-    #virtual machines
-    vm_suspicious = check_virtual_machine()
-    all_suspicious.extend(vm_suspicious)
-
+    security_monitor = SecurityMonitor()
+    security_monitor.start()
+    globals()['security_monitor'] = security_monitor
     try:
-        c = wmi.WMI()
-        
-        #Known legitimate vendor dirs
-        trusted_vendors = [
-            "amd", "nvidia", "intel", "microsoft", "realtek", "qualcomm",
-            "broadcom", "marvell", "synaptics", "logitech", "creative",
-            "asmedia", "asustek", "gigabyte", "msi", "dell", "hp", "lenovo"
-        ]
-        
-        #Known safe locations
-        safe_locations = [
-            r"C:\\Windows\\System32\\drivers",
-            r"C:\\Windows\\System32\\DriverStore",
-            r"C:\\Windows\\System32\\DriverStore\\FileRepository",
-            r"C:\\Windows\\WinSxS",
-            r"C:\\Program Files",
-            r"C:\\Program Files (x86)",
-            r"C:\\AMD",
-            r"C:\\NVIDIA",
-            r"C:\Intel",
-            r"C:\\DRIVERS",
-            r"C:\\SWSetup",
-            r"C:\\Dell",
-            r"C:\\HP",
-            r"C:\\ProgramData"
-        ]
-        drivers = c.Win32_SystemDriver(State="Running")
-        for driver in drivers:
-            try:
-                driver_name = driver.Name
-                path_name = driver.PathName
-                if not path_name:
-                    continue
-                #Skip Windows drivers
-                if driver_name.lower().startswith(('microsoft', 'ms')):
-                    continue
-                #Skip known vendor drivers
-                driver_lower = driver_name.lower()
-                if any(vendor in driver_lower for vendor in trusted_vendors):
-                    continue
-                #Ghost drivers
-                if not os.path.exists(path_name):
-                    all_suspicious.append(f"Ghost driver: {driver_name} (file missing)")
-                    continue
-                #Suspicious locations
-                path_lower = path_name.lower()
-                in_safe_location = any(path_lower.startswith(loc.lower()) for loc in safe_locations)
-                if in_safe_location:
-                    continue
-                suspicious_locations = [
-                    r"\\temp", r"\\tmp", r"\\users\\", r"\\appdata\\", r"\\downloads",
-                    r"\\desktop", r"\\documents", r"\\onedrive", r"\\dropbox",
-                    r"\\google", r"\\mega"
-                ]
-                
-                if any(susp in path_lower for susp in suspicious_locations):
-                    all_suspicious.append(f"Suspicious location: {driver_name} -> {path_name}")
-                
-                #Unusual file extensions or names
-                suspicious_extensions = ['.vbs', '.js', '.bat', '.cmd', '.ps1']
-                file_ext = os.path.splitext(path_name)[1].lower()
-                if file_ext in suspicious_extensions:
-                    all_suspicious.append(f"Unusual driver extension: {driver_name} ({file_ext})")
-                
-                #Check for rootkit-like behavior
-                rootkit_indicators = [
-                    'rootkit', 'hook', 'stealth', 'invisible', 'hidden',
-                    'tdss', 'zeroaccess', 'mebroot', 'alureon', 'rustock'
-                ]
-                if any(indicator in driver_lower for indicator in rootkit_indicators):
-                    all_suspicious.append(f"Rootkit indicator: {driver_name}")
-                
-                #Check for keyloggers
-                keylogger_indicators = ['keylog', 'klog', 'klg', 'keylogger', 'spy', 'monitor', 'recorder', 'sniffer', 'hookkb', 'hookmouse']
-                if any(indicator in driver_lower for indicator in keylogger_indicators):
-                    all_suspicious.append(f"Keylogger indicator: {driver_name}")
-            except Exception as e:
-                if "DEBUG" in globals() and DEBUG:
-                    print(f"Error checking driver {driver_name}: {str(e)}")
-                continue
-    except Exception as e:
-        if "DEBUG" in globals() and DEBUG:
-            print(f"Driver check failed: {str(e)}")
+        is_debugger_present = ctypes.windll.kernel32.IsDebuggerPresent()
+        if is_debugger_present:
+            all_suspicious.append("Debugger detected on startup")
+    except:
+        pass
     
     return all_suspicious
 
@@ -294,39 +334,32 @@ if suspicious:
         if not any(fp in item_lower for fp in false_positive_patterns):
             filtered_suspicious.append(item)
     if filtered_suspicious:
-        details = "\n".join(filtered_suspicious[:15])  # Show more issues
-        if len(filtered_suspicious) > 15:
-            details += f"\n... and {len(filtered_suspicious) - 15} more security warnings"
         message = "Security Alert\n\n"
-        #warnings
         debugger_warnings = [s for s in filtered_suspicious if any(word in s.lower() for word in ['debug', 'dbg', 'ida', 'ollydbg', 'windbg'])]
         vm_warnings = [s for s in filtered_suspicious if any(word in s.lower() for word in ['vm', 'virtual', 'qemu', 'hyper-v'])]
-        driver_warnings = [s for s in filtered_suspicious if any(word in s.lower() for word in ['driver', 'sys'])]
+        
         if debugger_warnings:
-            message += "⚠️ Debuggers detected (potential reverse engineering):\n"
-            for warning in debugger_warnings[:3]:
+            message += "⚠️ Debuggers detected:\n"
+            for warning in debugger_warnings[:2]:
                 message += f"  • {warning}\n"
             message += "\n"
+        
         if vm_warnings:
             message += "⚠️ Virtual environment detected:\n"
-            for warning in vm_warnings[:3]:
+            for warning in vm_warnings[:2]:
                 message += f"  • {warning}\n"
             message += "\n"
-        if driver_warnings:
-            message += "⚠️ Suspicious drivers detected:\n"
-            for warning in driver_warnings[:3]:
-                message += f"  • {warning}\n"
-            message += "\n"
+        
         message += "For maximum security, please close these tools before continuing."
         response = ctypes.windll.user32.MessageBoxW(0, 
             message,
-            "Security Alert - Binary Analysis Detected", 0x30 | 0x1)  # MB_ICONWARNING | MB_OKCANCEL
-        if response == 2:  # IDCANCEL
+            "Security Alert", 0x30 | 0x1)
+        if response == 2:
+            if 'security_monitor' in globals():
+                globals()['security_monitor'].stop()
             sys.exit(1)
         else:
-            print("Security warnings were acknowledged but application continues:")
-            for item in filtered_suspicious:
-                print(f"  - {item}")
+            pass
 
 #---------------------------------------------#
 
@@ -366,12 +399,16 @@ height = 265
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
     import pgpy
     from pgpy.constants import PubKeyAlgorithm, KeyFlags, HashAlgorithm, SymmetricKeyAlgorithm, CompressionAlgorithm
     import dearpygui.dearpygui as dpg
 except ImportError:
     os.system("python -m pip install cryptography pgpy dearpygui")
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
     import pgpy
     from pgpy.constants import PubKeyAlgorithm, KeyFlags, HashAlgorithm, SymmetricKeyAlgorithm, CompressionAlgorithm
     import dearpygui.dearpygui as dpg
@@ -380,11 +417,36 @@ except ImportError:
 
 def get_cipher(password, salt=None):
     if not password: 
-        password = "default_init_pass"
+        password = ""
     if salt is None:
         salt = os.urandom(16) 
-    key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 1200000, dklen=32)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+    )
+    key = kdf.derive(password.encode())
     return key, salt
+
+def get_combined_hash(priv_blob, encryption_key):
+    combined_material = str(priv_blob).encode() + bytes(encryption_key)
+    split_point = len(combined_material) // 2
+    salt_part = combined_material[:split_point]
+    password_part = combined_material[split_point:]
+    if len(salt_part) < 16:
+        padding = hashlib.sha256(combined_material).digest()
+        salt_part = (salt_part + padding)[:16]
+    elif len(salt_part) > 16:
+        salt_part = hashlib.sha256(salt_part).digest()[:16]
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=salt_part,
+        iterations=310000,
+    )
+    derived_key = kdf.derive(password_part)
+    return hashlib.sha512(derived_key).hexdigest()
 
 def UpdateList2():
     global keynames_cache, unlocked_encrypted_data, encryption_key
@@ -396,11 +458,10 @@ def UpdateList2():
                 dpg.configure_item("pub", items=[])
         else:
             dpg.configure_item("pub", items=["Keys Encrypted"])
-        sleep(1)
+        sleep(2)
 
 def decrypt_single_keypair(keyname):
     global unlocked_encrypted_data, encryption_key, encryption_nonce
-    
     if not unlocked_encrypted_data or not encryption_key:
         return None, None
     try:
@@ -408,14 +469,13 @@ def decrypt_single_keypair(keyname):
         decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
         keypairs = json.loads(decrypted.decode('utf-8'))
         for pair in keypairs:
-            if pair['keyname'] == keyname:
+            if constant_time_compare(pair['keyname'], keyname):
                 private_key = str(pair['private_key'])
                 public_key = str(pair['public_key'])
-                pair['private_key'] = None
-                pair['public_key'] = None
                 return private_key, public_key
-    except:
-        pass
+    except Exception as e:
+        if DEBUG:
+            print(f"Decrypt keypair error: {e}")
     return None, None
 
 def get_keypair(keyname):
@@ -432,8 +492,6 @@ def decrypt_all_keynames():
         decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
         keypairs = json.loads(decrypted.decode('utf-8'))
         keynames = [pair['keyname'] for pair in keypairs]
-        decrypted = None
-        keypairs = None
         keynames_cache = keynames
         return keynames
     except:
@@ -453,22 +511,32 @@ def clear_sensitive_memory():
 
 def unlock_keys(sender, app_data):
     global unlocked_encrypted_data, encryption_key, encryption_salt, encryption_nonce, keynames_cache
-    
+
     password = dpg.get_value("input_")
+    if constant_time_compare(password, ""):
+        password = ""
+    
     if unlocked_encrypted_data is not None:
-        key, salt = get_cipher(password)
-        aesgcm = AESGCM(encryption_key)
-        decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
-        aesgcm_new = AESGCM(key)
-        nonce = os.urandom(12)
-        ciphertext = aesgcm_new.encrypt(nonce, decrypted, None)
-        with open(KEYS_PATH, 'wb') as f:
-            f.write(salt + nonce + ciphertext)
-        clear_sensitive_memory()
-        unlocked_encrypted_data = None
-        keynames_cache = []
-        dpg.set_value("input_", "") 
-        return
+        try:
+            key, salt = get_cipher(password)
+            aesgcm = AESGCM(encryption_key)
+            decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
+            aesgcm_new = AESGCM(key)
+            nonce = os.urandom(12)
+            ciphertext = aesgcm_new.encrypt(nonce, decrypted, None)
+            with open(KEYS_PATH, 'wb') as f:
+                f.write(salt + nonce + ciphertext)
+            clear_sensitive_memory()
+            unlocked_encrypted_data = None
+            keynames_cache = []
+            dpg.set_value("input_", "")
+            return
+        except:
+            clear_sensitive_memory()
+            unlocked_encrypted_data = None
+            keynames_cache = []
+            dpg.set_value("input_", "")
+            return
     if not os.path.exists(KEYS_PATH):
         empty_data = json.dumps([]).encode('utf-8')
         key, salt = get_cipher(password)
@@ -481,13 +549,12 @@ def unlock_keys(sender, app_data):
         unlocked_encrypted_data = ciphertext
         keynames_cache = []
         decrypt_all_keynames()
-        dpg.set_value("input_", "")  # Clear password field after successful unlock
+        dpg.set_value("input_", "")
         return
     try:
         with open(KEYS_PATH, 'rb') as f:
             content = f.read()
         if len(content) < 44:
-            # Create empty data
             empty_data = json.dumps([]).encode('utf-8')
             key, salt = get_cipher(password)
             aesgcm = AESGCM(key)
@@ -499,21 +566,23 @@ def unlock_keys(sender, app_data):
             unlocked_encrypted_data = ciphertext
             keynames_cache = []
             decrypt_all_keynames()
-            dpg.set_value("input_", "")  # Clear password field
+            dpg.set_value("input_", "")
             return
+        
         salt = content[:16]
         nonce = content[16:28]
         ciphertext_with_tag = content[28:]
         key, _ = get_cipher(password, salt=salt)
+        
         aesgcm = AESGCM(key)
         try:
             decrypted = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
-            encryption_key = bytearray(key)
+            encryption_key = key
             encryption_salt = salt
             encryption_nonce = nonce
             unlocked_encrypted_data = ciphertext_with_tag
             decrypt_all_keynames()
-            dpg.set_value("input_", "")  # Clear password field after successful unlock
+            dpg.set_value("input_", "")
         except:
             clear_sensitive_memory()
             unlocked_encrypted_data = None
@@ -522,7 +591,7 @@ def unlock_keys(sender, app_data):
                 print("Decryption failed - incorrect password")
     except Exception as e: 
         if DEBUG:
-            print(f"Error: {e}")
+            print(f"Unlock error: {e}")
         clear_sensitive_memory()
         unlocked_encrypted_data = None
         keynames_cache = []
@@ -531,51 +600,71 @@ def create_keys(sender, app_data):
     global unlocked_encrypted_data, encryption_key, encryption_salt, encryption_nonce
     if not unlocked_encrypted_data or not encryption_key:
         return
+    
     name = dpg.get_value("input2")
     size = dpg.get_value("Ks")
-    aesgcm = AESGCM(encryption_key)
-    decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
-    keypairs = json.loads(decrypted.decode('utf-8'))
-    key = pgpy.PGPKey.new(PubKeyAlgorithm.RSAEncryptOrSign, size)
-    uid = pgpy.PGPUID.new(name)
-    key.add_uid(uid, usage={KeyFlags.Sign, KeyFlags.EncryptCommunications, KeyFlags.EncryptStorage},
-                hashes=[HashAlgorithm.SHA256, HashAlgorithm.SHA512],
-                ciphers=[SymmetricKeyAlgorithm.AES256, SymmetricKeyAlgorithm.AES128],
-                compression=[CompressionAlgorithm.ZLIB, CompressionAlgorithm.Uncompressed])
-    keypairs.append({"keyname": name, "private_key": str(key), "public_key": str(key.pubkey)})
-    new_data = json.dumps(keypairs).encode('utf-8')
-    aesgcm = AESGCM(encryption_key)
-    new_nonce = os.urandom(12)
-    new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
-    encryption_nonce = new_nonce
-    unlocked_encrypted_data = new_ciphertext
-    with open(KEYS_PATH, 'wb') as f:
-        f.write(encryption_salt + new_nonce + new_ciphertext)
-    decrypt_all_keynames()
-    decrypted = None
-    keypairs = None
-    new_data = None
+    
+    if not name or len(name.strip()) == 0:
+        return
+    
+    try:
+        aesgcm = AESGCM(encryption_key)
+        decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
+        keypairs = json.loads(decrypted.decode('utf-8'))
+        for pair in keypairs:
+            if constant_time_compare(pair['keyname'], name):
+                return
+        key = pgpy.PGPKey.new(PubKeyAlgorithm.RSAEncryptOrSign, size)
+        uid = pgpy.PGPUID.new(name)
+        key.add_uid(uid, usage={KeyFlags.Sign, KeyFlags.EncryptCommunications, KeyFlags.EncryptStorage},
+                    hashes=[HashAlgorithm.SHA256, HashAlgorithm.SHA512],
+                    ciphers=[SymmetricKeyAlgorithm.AES256, SymmetricKeyAlgorithm.AES128,
+                            SymmetricKeyAlgorithm.AES192, SymmetricKeyAlgorithm.Camellia256],
+                    compression=[CompressionAlgorithm.ZLIB, CompressionAlgorithm.Uncompressed])
+        keypairs.append({
+            "keyname": name, 
+            "private_key": str(key), 
+            "public_key": str(key.pubkey)
+        })
+        new_data = json.dumps(keypairs).encode('utf-8')
+        new_nonce = os.urandom(12)
+        new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
+        encryption_nonce = new_nonce
+        unlocked_encrypted_data = new_ciphertext
+        
+        with open(KEYS_PATH, 'wb') as f:
+            f.write(encryption_salt + new_nonce + new_ciphertext)
+        decrypt_all_keynames()
+        
+    except Exception as e:
+        if DEBUG:
+            print(f"Error creating key: {e}")
+        import traceback
+        traceback.print_exc()
 
 def encrypt_string(sender, app_data):
     _, pub_blob = get_keypair(dpg.get_value("pub"))
     if pub_blob:
-        pub_key, _ = pgpy.PGPKey.from_blob(str(pub_blob))
-        msg = pgpy.PGPMessage.new(dpg.get_value("input"), encoding="utf-8")
-        dpg.set_value("input", str(pub_key.encrypt(msg)))
+        try:
+            pub_key, _ = pgpy.PGPKey.from_blob(str(pub_blob))
+            msg = pgpy.PGPMessage.new(dpg.get_value("input"), encoding="utf-8")
+            encrypted = pub_key.encrypt(msg)
+            dpg.set_value("input", str(encrypted))
+        except Exception as e:
+            if DEBUG:
+                print(f"Encrypt string error: {e}")
 
 def decrypt_string(sender, app_data):
     priv_blob, _ = get_keypair(dpg.get_value("pub"))
     if priv_blob:
-        priv_key, _ = pgpy.PGPKey.from_blob(str(priv_blob))
         try:
+            priv_key, _ = pgpy.PGPKey.from_blob(str(priv_blob))
             msg = pgpy.PGPMessage.from_blob(dpg.get_value("input"))
             dec = priv_key.decrypt(msg)
             result = dec.message
             if isinstance(result, (bytes, bytearray)):
                 result = result.decode('utf-8', errors='replace')
             dpg.set_value("input", str(result))
-            priv_key = None
-            dec = None
         except Exception as e: 
             if DEBUG:
                 print(f"Text Decrypt Error: {e}")
@@ -583,15 +672,19 @@ def decrypt_string(sender, app_data):
 def sign_string(sender, app_data):
     priv_blob, _ = get_keypair(dpg.get_value("pub"))
     if priv_blob:
-        priv_key, _ = pgpy.PGPKey.from_blob(str(priv_blob))
-        msg = pgpy.PGPMessage.new(dpg.get_value("input"), encoding="utf-8")
-        msg |= priv_key.sign(msg)
-        dpg.set_value("input", str(msg))
-        priv_key = None
+        try:
+            priv_key, _ = pgpy.PGPKey.from_blob(str(priv_blob))
+            msg = pgpy.PGPMessage.new(dpg.get_value("input"), encoding="utf-8")
+            msg |= priv_key.sign(msg)
+            dpg.set_value("input", str(msg))
+        except Exception as e:
+            if DEBUG:
+                print(f"Sign string error: {e}")
 
 def select_file(sender, appdata):
     global dF
-    root = tk.Tk(); root.withdraw()
+    root = tk.Tk()
+    root.withdraw()
     dF = filedialog.askopenfilename()
     root.destroy()
 
@@ -600,17 +693,14 @@ def encrypt_file(sender, app_data):
     priv_blob, _ = get_keypair(dpg.get_value("pub"))
     if priv_blob and encryption_key and dF and os.path.exists(dF):
         try:
-            combined_material = str(priv_blob).encode() + bytes(encryption_key)
-            derived_password = hashlib.sha512(combined_material).hexdigest()
+            derived_password = get_combined_hash(priv_blob, encryption_key)
             with open(dF, 'rb') as f:
                 file_data = f.read()
             msg = pgpy.PGPMessage.new(file_data)
-            encrypted_msg = msg.encrypt(derived_password)
+            encrypted_msg = msg.encrypt(derived_password, symmetric_algorithm=SymmetricKeyAlgorithm.AES256)
             out = bytes(encrypted_msg)
             with open(dF, 'wb') as f:
                 f.write(out)
-            derived_password = None
-            file_data = None
         except Exception as e:
             if DEBUG:
                 print(f"Encryption failed: {e}")
@@ -620,8 +710,7 @@ def decrypt_file(sender, app_data):
     priv_blob, _ = get_keypair(dpg.get_value("pub"))
     if priv_blob and encryption_key and dF and os.path.exists(dF):
         try:
-            combined_material = str(priv_blob).encode() + bytes(encryption_key)
-            derived_password = hashlib.sha512(combined_material).hexdigest()
+            derived_password = get_combined_hash(priv_blob, encryption_key)
             msg = pgpy.PGPMessage.from_file(dF)
             decrypted_msg = msg.decrypt(derived_password)
             dec_data = decrypted_msg.message
@@ -629,8 +718,6 @@ def decrypt_file(sender, app_data):
                 dec_data = dec_data.encode('utf-8')
             with open(dF, 'wb') as f:
                 f.write(dec_data)
-            derived_password = None
-            priv_blob = None
         except Exception as e:
             if DEBUG:
                 print(f"Decryption failed: {e}")
@@ -644,53 +731,53 @@ def display_private_key(sender, app_data):
     prv, _ = get_keypair(dpg.get_value("pub"))
     if prv: 
         dpg.set_value("input", str(prv))
-        prv = None
 
 def delete_keys(sender, app_data):
     global unlocked_encrypted_data, encryption_key, encryption_nonce
     target = dpg.get_value("pub")
     if not unlocked_encrypted_data or not encryption_key:
         return
-    aesgcm = AESGCM(encryption_key)
-    decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
-    keypairs = json.loads(decrypted.decode('utf-8'))
-    keypairs = [k for k in keypairs if k['keyname'] != target]
-    new_data = json.dumps(keypairs).encode('utf-8')
-    new_nonce = os.urandom(12)
-    new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
-    encryption_nonce = new_nonce
-    unlocked_encrypted_data = new_ciphertext
-    with open(KEYS_PATH, 'wb') as f:
-        f.write(encryption_salt + new_nonce + new_ciphertext)
-    decrypt_all_keynames()
-    decrypted = None
-    keypairs = None
-    new_data = None
+    try:
+        aesgcm = AESGCM(encryption_key)
+        decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
+        keypairs = json.loads(decrypted.decode('utf-8'))
+        keypairs = [k for k in keypairs if not constant_time_compare(k['keyname'], target)]
+        new_data = json.dumps(keypairs).encode('utf-8')
+        new_nonce = os.urandom(12)
+        new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
+        encryption_nonce = new_nonce
+        unlocked_encrypted_data = new_ciphertext
+        with open(KEYS_PATH, 'wb') as f:
+            f.write(encryption_salt + new_nonce + new_ciphertext)
+        decrypt_all_keynames()
+    except Exception as e:
+        if DEBUG:
+            print(f"Error deleting key: {e}")
 
 def set_public_key(sender, app_data):
     global unlocked_encrypted_data, encryption_key, encryption_nonce
-    
     target = dpg.get_value("pub")
     new_pub_key = dpg.get_value("input")
     if not unlocked_encrypted_data or not encryption_key:
         return
-    aesgcm = AESGCM(encryption_key)
-    decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
-    keypairs = json.loads(decrypted.decode('utf-8'))
-    for k in keypairs:
-        if k['keyname'] == target:
-            k['public_key'] = new_pub_key
-            break
-    new_data = json.dumps(keypairs).encode('utf-8')
-    new_nonce = os.urandom(12)
-    new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
-    encryption_nonce = new_nonce
-    unlocked_encrypted_data = new_ciphertext
-    with open(KEYS_PATH, 'wb') as f:
-        f.write(encryption_salt + new_nonce + new_ciphertext)
-    decrypted = None
-    keypairs = None
-    new_data = None
+    try:
+        aesgcm = AESGCM(encryption_key)
+        decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
+        keypairs = json.loads(decrypted.decode('utf-8'))
+        for k in keypairs:
+            if constant_time_compare(k['keyname'], target):
+                k['public_key'] = new_pub_key
+                break
+        new_data = json.dumps(keypairs).encode('utf-8')
+        new_nonce = os.urandom(12)
+        new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
+        encryption_nonce = new_nonce
+        unlocked_encrypted_data = new_ciphertext
+        with open(KEYS_PATH, 'wb') as f:
+            f.write(encryption_salt + new_nonce + new_ciphertext)
+    except Exception as e:
+        if DEBUG:
+            print(f"Error setting public key: {e}")
 
 def set_private_key(sender, app_data):
     global unlocked_encrypted_data, encryption_key, encryption_nonce
@@ -698,29 +785,30 @@ def set_private_key(sender, app_data):
     new_priv_key = dpg.get_value("input")
     if not unlocked_encrypted_data or not encryption_key:
         return
-    aesgcm = AESGCM(encryption_key)
-    decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
-    keypairs = json.loads(decrypted.decode('utf-8'))
-    for k in keypairs:
-        if k['keyname'] == target:
-            k['private_key'] = new_priv_key
-            break
-    new_data = json.dumps(keypairs).encode('utf-8')
-    new_nonce = os.urandom(12)
-    new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
-    encryption_nonce = new_nonce
-    unlocked_encrypted_data = new_ciphertext
-    with open(KEYS_PATH, 'wb') as f:
-        f.write(encryption_salt + new_nonce + new_ciphertext)
-    decrypted = None
-    keypairs = None
-    new_data = None
+    try:
+        aesgcm = AESGCM(encryption_key)
+        decrypted = aesgcm.decrypt(encryption_nonce, unlocked_encrypted_data, None)
+        keypairs = json.loads(decrypted.decode('utf-8'))
+        for k in keypairs:
+            if constant_time_compare(k['keyname'], target):
+                k['private_key'] = new_priv_key
+                break
+        new_data = json.dumps(keypairs).encode('utf-8')
+        new_nonce = os.urandom(12)
+        new_ciphertext = aesgcm.encrypt(new_nonce, new_data, None)
+        encryption_nonce = new_nonce
+        unlocked_encrypted_data = new_ciphertext
+        with open(KEYS_PATH, 'wb') as f:
+            f.write(encryption_salt + new_nonce + new_ciphertext)
+    except Exception as e:
+        if DEBUG:
+            print(f"Error setting private key: {e}")
 
 #---------------------------GUI---------------------------#
 
 if not os.path.exists(KEYS_PATH):
     if DEBUG:
-        print(f"File not found. Creating at: {KEYS_PATH}")
+        print(f"Creating new key file at: {KEYS_PATH}")
     key, salt = get_cipher("")
     data = json.dumps([]).encode('utf-8')
     aesgcm = AESGCM(key)
@@ -728,16 +816,16 @@ if not os.path.exists(KEYS_PATH):
     ciphertext = aesgcm.encrypt(nonce, data, None)
     with open(KEYS_PATH, "wb") as f:
         f.write(salt + nonce + ciphertext)
-    encryption_key = bytearray(key)
+    encryption_key = key
     encryption_salt = salt
     encryption_nonce = nonce
     unlocked_encrypted_data = ciphertext
     decrypt_all_keynames()
     if DEBUG:
-        print("New key file created and automatically unlocked")
+        print("New key file created and unlocked")
 else:
     if DEBUG:
-        print(f"Found existing file at: {KEYS_PATH}")
+        print(f"Found existing key file at: {KEYS_PATH}")
     try:
         with open(KEYS_PATH, 'rb') as f:
             content = f.read()
@@ -749,15 +837,19 @@ else:
             aesgcm = AESGCM(key)
             try:
                 decrypted = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
-                encryption_key = bytearray(key)
+                encryption_key = key
                 encryption_salt = salt
                 encryption_nonce = nonce
                 unlocked_encrypted_data = ciphertext_with_tag
                 decrypt_all_keynames()
+                if DEBUG:
+                    print("Auto-unlock successful")
             except:
                 clear_sensitive_memory()
                 unlocked_encrypted_data = None
                 keynames_cache = []
+                if DEBUG:
+                    print("Auto-unlock failed")
     except Exception as e:
         if DEBUG:
             print(f"Auto-unlock error: {e}")
@@ -800,7 +892,7 @@ with dpg.window(label="pgpeasier -- by c.o.r.a.", width=width, height=height, no
                 dpg.add_input_text(tag="input_", width=250, password=True)
                 dpg.add_button(label="Unlock / Lock Keys", callback=unlock_keys)
             with dpg.group():
-                dpg.add_listbox(label="Key pair", width=175, tag="pub")
+                dpg.add_listbox(label="Key pair", width=175, num_items=6, tag="pub")
                 threading.Thread(target=UpdateList2, daemon=True).start()
             with dpg.group(horizontal=True):
                 dpg.add_input_text(label="Key name", tag="input2", width=100)
@@ -812,6 +904,9 @@ dpg.show_viewport()
 while dpg.is_dearpygui_running():
     dpg.render_dearpygui_frame()
 dpg.destroy_context()
+
+if 'security_monitor' in globals():
+    globals()['security_monitor'].stop()
 
 clear_sensitive_memory()
 
