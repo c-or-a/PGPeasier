@@ -1,11 +1,16 @@
 # PGPeasier by c.o.r.a.
 A Python based PGP tool with keyring encryption.
 
-SHA256: dbc861......d6f3d6
+SHA256: 0f70a8......4d7a32
+
+## v3.0.3
+
+* Constant-time comparisons for all sensitive operations to prevent timing attacks.
+* Real-time, not just run-time, anti debugger/keylogger/virtual-machine.
+* Updated hash and salt creation for file encryption.
+* Now using AES GCM for file encryption.
 
 ## v3.0.2
-
-Quantum Resistance | 2FE.
 
 * Files no longer assymetrically encrypted with the public RSA key, which is vulnerable to Shor's algorithm.
 * Now uses a combination of the password hash and a hash of the private key. Ensuring your files are quantum resistant.
