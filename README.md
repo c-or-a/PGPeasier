@@ -1,7 +1,11 @@
 # PGPeasier by c.o.r.a.
 A Python based PGP tool with keyring encryption.
 
-SHA256: 98bed4......3a40a0
+SHA256: b7c829......333b87
+
+## v3.0.4
+* Removed janky anti debug/vm/keylog slop code.
+* Added Themida 3.2.2.22 protected binary to release, allowing users to curate their security.
 
 ## v3.0.3
 
