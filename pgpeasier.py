@@ -3,7 +3,7 @@ PGPeasier - GUI PGP Tool
 
 Original code Copyright © 2026 c.o.r.a.
 Licensed under GNU General Public License v3.0 (GPLv3).
-See LICENSE.txt for full license text.
+See 'LICENSE' for full license text.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@ THIRD-PARTY COMPONENTS:
 - psutil (BSD) - Process utilities
 - Python Standard Library (PSF License)
 
-See THIRD_PARTY_LICENSES.txt for complete license texts.
+See 'THIRD_PARTY_LICENSES' for complete license texts.
 
 DISCLAIMER:
 This software is provided "AS IS" without warranty of any kind.
@@ -38,336 +38,10 @@ except ImportError:
     def set_windows_icon():
         return False
 
-#------security imports------#
-import ctypes
-import sys
-import os
-import hashlib
-import subprocess
-import json
-import re
-import time
-import hmac
-import threading
-import queue
-from ctypes import wintypes
-#---------------------------#
-
-kernel32 = ctypes.WinDLL('kernel32')
-user32 = ctypes.WinDLL('user32')
-SW_HIDE = 0
-hwnd = kernel32.GetConsoleWindow()
-if hwnd:
-    user32.ShowWindow(hwnd, SW_HIDE)
-
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-if not is_admin():
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    sys.exit(0)
-
-#--------------more security imports--------------#
-try:
-    import wmi
-    import win32api
-    import win32gui
-    import win32process
-    import win32con
-except ImportError:
-    os.system("python -m pip install pywin32 wmi")
-    import wmi
-    import win32api
-    import win32gui
-    import win32process
-    import win32con
-#-------------------------------------------------#
-
-#---------------security checks---------------#
-def constant_time_compare(a, b):
-    if isinstance(a, str):
-        a = a.encode()
-    if isinstance(b, str):
-        b = b.encode()
-    if len(a) != len(b):
-        return False
-    result = 0
-    for x, y in zip(a, b):
-        result |= x ^ y
-    return result == 0
-
-class SecurityMonitor:
-    def __init__(self):
-        self.running = True
-        self.suspicious_count = 0
-        self.max_suspicious = 10
-        self.detected_threats = []
-        self.thread = None
-        self.check_queue = queue.Queue()
-        self.last_check_time = {}
-
-        self.debugger_processes = [
-            'x64dbg.exe', 'x32dbg.exe', 'ollydbg.exe', 'ida.exe', 'ida64.exe',
-            'windbg.exe', 'dbgview.exe', 'procexp.exe', 'procmon.exe',
-            'processhacker.exe', 'cheatengine.exe'
-        ]
-        
-        self.keylogger_indicators = [
-            'keylog', 'klog', 'klg', 'keylogger', 'spy', 'monitor',
-            'recorder', 'sniffer', 'hookkb', 'hookmouse'
-        ]
-    
-    def start(self):
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
-    
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-    
-    def _should_check(self, check_name, interval):
-        current_time = time.time()
-        last_time = self.last_check_time.get(check_name, 0)
-        return current_time - last_time >= interval
-    
-    def _update_check_time(self, check_name):
-        self.last_check_time[check_name] = time.time()
-    
-    def _check_debuggers(self):
-        suspicious = []
-        
-        try:
-            is_debugger_present = ctypes.windll.kernel32.IsDebuggerPresent()
-            if is_debugger_present:
-                suspicious.append("Debugger detected via IsDebuggerPresent")
-            
-            try:
-                import psutil
-                count = 0
-                for proc in psutil.process_iter(['name']):
-                    try:
-                        proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-                        for debugger in self.debugger_processes[:10]:
-                            if debugger in proc_name:
-                                suspicious.append(f"Debugger process: {proc_name}")
-                                break
-                        count += 1
-                        if count > 50:
-                            break
-                    except:
-                        continue
-            except ImportError:
-                pass
-                
-        except Exception as e:
-            if "DEBUG" in globals() and DEBUG:
-                print(f"Debugger check error: {e}")
-        
-        return suspicious
-    
-    def _check_virtualization(self):
-        suspicious = []
-        
-        try:
-            c = wmi.WMI()
-            for computer in c.Win32_ComputerSystem()[:2]:
-                manufacturer = computer.Manufacturer.lower()
-                model = computer.Model.lower()
-                vm_indicators = ['vmware', 'virtualbox', 'qemu', 'hyper-v']
-                for indicator in vm_indicators:
-                    if indicator in manufacturer or indicator in model:
-                        suspicious.append(f"VM: {manufacturer} {model}")
-                        break    
-        except Exception as e:
-            if "DEBUG" in globals() and DEBUG:
-                print(f"VM check error: {e}")
-        return suspicious
-    
-    def _check_drivers(self):
-        suspicious = []
-        
-        try:
-            c = wmi.WMI()
-            trusted_vendors = ['amd', 'nvidia', 'intel', 'microsoft', 'realtek']
-            drivers = list(c.Win32_SystemDriver(State="Running"))[:20]
-            for driver in drivers:
-                try:
-                    driver_name = driver.Name.lower()
-                    if any(vendor in driver_name for vendor in trusted_vendors):
-                        continue
-                    if any(indicator in driver_name for indicator in self.keylogger_indicators):
-                        suspicious.append(f"Suspicious driver: {driver.Name}")
-                except:
-                    continue
-        except Exception as e:
-            if "DEBUG" in globals() and DEBUG:
-                print(f"Driver check error: {e}")
-        
-        return suspicious
-    
-    def _check_keyloggers(self):
-        suspicious = []
-        try:
-            try:
-                import psutil
-                count = 0
-                for proc in psutil.process_iter(['name']):
-                    try:
-                        proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-                        for indicator in self.keylogger_indicators[:10]:
-                            if indicator in proc_name:
-                                suspicious.append(f"Keylogger process: {proc_name}")
-                                break
-                        count += 1
-                        if count > 30:
-                            break
-                    except:
-                        continue
-            except ImportError:
-                pass
-                
-        except Exception as e:
-            if "DEBUG" in globals() and DEBUG:
-                print(f"Keylogger check error: {e}")
-        
-        return suspicious
-    
-    def _check_memory(self):
-        suspicious = []
-        
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            mem_info = process.memory_info()
-            if mem_info.rss > 300 * 1024 * 1024:
-                suspicious.append(f"High memory: {mem_info.rss // (1024*1024)}MB")
-        except Exception as e:
-            if "DEBUG" in globals() and DEBUG:
-                print(f"Memory check error: {e}")
-        
-        return suspicious
-    
-    def _run_checks(self):
-        all_suspicious = []
-        if self._should_check('debuggers', 3):
-            all_suspicious.extend(self._check_debuggers())
-            self._update_check_time('debuggers')
-        if self._should_check('virtualization', 7):
-            all_suspicious.extend(self._check_virtualization())
-            self._update_check_time('virtualization')
-        if self._should_check('drivers', 10):
-            all_suspicious.extend(self._check_drivers())
-            self._update_check_time('drivers')
-        if self._should_check('keyloggers', 5):
-            all_suspicious.extend(self._check_keyloggers())
-            self._update_check_time('keyloggers')
-        if self._should_check('memory', 8):
-            all_suspicious.extend(self._check_memory())
-            self._update_check_time('memory')
-        
-        return all_suspicious
-    
-    def _monitor_loop(self):
-        while self.running:
-            try:
-                suspicious = self._run_checks()
-                if suspicious:
-                    self.detected_threats.extend(suspicious)
-                    self.suspicious_count += len(suspicious)
-                    if len(self.detected_threats) > 20:
-                        self.detected_threats = self.detected_threats[-20:]
-                    if self.suspicious_count >= self.max_suspicious:
-                        self._critical_response()
-                time.sleep(1)
-            except Exception as e:
-                if "DEBUG" in globals() and DEBUG:
-                    print(f"Monitor loop error: {e}")
-                time.sleep(2)
-    
-    def _critical_response(self):
-        if self.detected_threats:
-            recent_threats = self.detected_threats[-5:]
-            
-            message = "CRITICAL SECURITY THREAT\n\n"
-            message += "Multiple security violations detected:\n"
-            for threat in recent_threats:
-                message += f"• {threat}\n"
-            message += "\nApplication will now exit."
-            ctypes.windll.user32.MessageBoxW(0, message, "Critical Security Alert", 0x10)
-    
-            os._exit(1)
-
-def comprehensive_security_check():
-    all_suspicious = []
-    
-    security_monitor = SecurityMonitor()
-    security_monitor.start()
-    globals()['security_monitor'] = security_monitor
-    try:
-        is_debugger_present = ctypes.windll.kernel32.IsDebuggerPresent()
-        if is_debugger_present:
-            all_suspicious.append("Debugger detected on startup")
-    except:
-        pass
-    
-    return all_suspicious
-
-suspicious = comprehensive_security_check()
-
-if suspicious:
-    filtered_suspicious = []
-    false_positive_patterns = [
-        'amd', 'nvidia', 'intel', 'microsoft', 'realtek', 'qualcomm',
-        'broadcom', 'marvell', 'synaptics', 'logitech', 'vmware tools', 'monitor'
-    ]
-    for item in suspicious:
-        item_lower = item.lower()
-        if not any(fp in item_lower for fp in false_positive_patterns):
-            filtered_suspicious.append(item)
-    if filtered_suspicious:
-        message = "Security Alert\n\n"
-        debugger_warnings = [s for s in filtered_suspicious if any(word in s.lower() for word in ['debug', 'dbg', 'ida', 'ollydbg', 'windbg'])]
-        vm_warnings = [s for s in filtered_suspicious if any(word in s.lower() for word in ['vm', 'virtual', 'qemu', 'hyper-v'])]
-        
-        if debugger_warnings:
-            message += "⚠️ Debuggers detected:\n"
-            for warning in debugger_warnings[:2]:
-                message += f"  • {warning}\n"
-            message += "\n"
-        
-        if vm_warnings:
-            message += "⚠️ Virtual environment detected:\n"
-            for warning in vm_warnings[:2]:
-                message += f"  • {warning}\n"
-            message += "\n"
-        
-        message += "For maximum security, please close these tools before continuing."
-        response = ctypes.windll.user32.MessageBoxW(0, 
-            message,
-            "Security Alert", 0x30 | 0x1)
-        if response == 2:
-            if 'security_monitor' in globals():
-                globals()['security_monitor'].stop()
-            sys.exit(1)
-        else:
-            pass
-
-#---------------------------------------------#
-
 #------------------default python libs------------------#
 import os
 import json
 import base64
-import hashlib
 import threading
 import tkinter as tk
 from tkinter import filedialog
@@ -378,7 +52,13 @@ import sys
 warnings.filterwarnings("ignore", category=UserWarning) 
 #-------------------------------------------------------#
 
+
+
 #---Globals---#
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 def get_base_path():
     if hasattr(sys, '_MEIPASS'):
         return os.path.dirname(sys.executable)
@@ -905,9 +585,6 @@ while dpg.is_dearpygui_running():
     dpg.render_dearpygui_frame()
 dpg.destroy_context()
 
-# Clean up security monitor
-if 'security_monitor' in globals():
-    globals()['security_monitor'].stop()
 
 clear_sensitive_memory()
 
