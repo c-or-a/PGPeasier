@@ -1,7 +1,7 @@
 # PGPeasier by c.o.r.a.
 A Python based PGP tool with keyring encryption.
 
-SHA256: b7c829......333b87
+SHA256: dbf9d0......588562
 
 ## v3.0.4
 * Removed janky anti debug/vm/keylog slop code.
