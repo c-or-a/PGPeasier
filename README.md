@@ -3,7 +3,7 @@ A Python based PGP tool with keyring encryption.
 
 SHA256: bb7ee4......8b8baf
 
-## v3.0.4
+## v3.0.5
 * Removed janky anti debug/vm/keylog slop code.
 * Added Themida 3.2.2.22 protected binary to release, allowing users to curate their security.
 
