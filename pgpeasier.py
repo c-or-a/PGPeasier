@@ -38,6 +38,16 @@ except ImportError:
     def set_windows_icon():
         return False
 
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+    
+def get_base_path():
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 #------------------default python libs------------------#
 import os
 import json
@@ -55,14 +65,6 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 #---Globals---#
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-def get_base_path():
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = get_base_path()
 KEYS_PATH = os.path.join(BASE_DIR, 'keys')
 
@@ -72,7 +74,7 @@ encryption_salt = None
 encryption_nonce = None
 keynames_cache = []
 dF = ''
-DEBUG = False
+DEBUG = True
 width = 550
 height = 265
 #-------------#
@@ -94,6 +96,14 @@ except ImportError:
     import dearpygui.dearpygui as dpg
 
 #--------------------------Functions--------------------------#
+
+def constant_time_compare(a, b):
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= ord(x) ^ ord(y)
+    return result == 0
 
 def get_cipher(password, salt=None):
     if not password: 
